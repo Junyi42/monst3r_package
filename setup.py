@@ -21,6 +21,7 @@ setup(
         'tensorboard',
         'pyglet<2',
         'huggingface-hub[torch]>=0.22',
+        "seaborn",
         "sam2 @ file://localhost/" + os.path.abspath("third_party/sam2"),
     ],
     extras_require={

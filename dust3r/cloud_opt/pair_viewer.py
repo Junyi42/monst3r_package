@@ -1,6 +1,3 @@
-# Copyright (C) 2024-present Naver Corporation. All rights reserved.
-# Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
-#
 # --------------------------------------------------------
 # Dummy optimizer for visualizing pairs
 # --------------------------------------------------------
@@ -114,13 +111,22 @@ class PairViewer (BasePCOptimizer):
     def get_im_poses(self):
         return self.im_poses
 
-    def depth_to_pts3d(self):
+    def depth_to_pts3d(self, raw_pts=False):
         pts3d = []
-        for d, intrinsics, im_pose in zip(self.depth, self.get_intrinsics(), self.get_im_poses()):
-            pts, _ = depthmap_to_absolute_camera_coordinates(d.cpu().numpy(),
-                                                             intrinsics.cpu().numpy(),
-                                                             im_pose.cpu().numpy())
-            pts3d.append(torch.from_numpy(pts).to(device=self.device))
+        if raw_pts:
+            im_poses = self.get_im_poses()
+            if im_poses[0].sum() == 4:
+                pts3d.append(self.pred_i['0_1'])
+                pts3d.append(self.pred_j['0_1'])
+            else:
+                pts3d.append(self.pred_j['1_0'])
+                pts3d.append(self.pred_i['1_0'])
+        else:
+            for d, intrinsics, im_pose in zip(self.depth, self.get_intrinsics(), self.get_im_poses()):
+                pts, _ = depthmap_to_absolute_camera_coordinates(d.cpu().numpy(),
+                                                                intrinsics.cpu().numpy(),
+                                                                im_pose.cpu().numpy())
+                pts3d.append(torch.from_numpy(pts).to(device=self.device))
         return pts3d
 
     def forward(self):

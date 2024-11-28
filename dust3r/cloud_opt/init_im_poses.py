@@ -18,7 +18,28 @@ from dust3r.post_process import estimate_focal_knowing_depth
 from dust3r.viz import to_numpy
 
 from dust3r.cloud_opt.commons import edge_str, i_j_ij, compute_edge_scores
+import matplotlib.pyplot as plt
+import seaborn as sns
 
+def draw_edge_scores_map(edge_scores, save_path, n_imgs=None):
+    # Determine the size of the heatmap
+    if n_imgs is None:
+        n_imgs = max(max(edge) for edge in edge_scores) + 1
+
+    # Create a matrix to hold the scores
+    heatmap_matrix = np.full((n_imgs, n_imgs), np.nan)
+
+    # Populate the matrix with the edge scores
+    for (i, j), score in edge_scores.items():
+        heatmap_matrix[i, j] = score
+
+    # Plotting the heatmap
+    plt.figure(figsize=(int(5.5*np.log(n_imgs)-2), int((5.5*np.log(n_imgs)-2) * 3 / 4)))
+    sns.heatmap(heatmap_matrix, annot=True, fmt=".1f", cmap="viridis", cbar=True, annot_kws={"fontsize": int(-4.2*np.log(n_imgs)+22.4)})
+    plt.title("Heatmap of Edge Scores")
+    plt.xlabel("Node")
+    plt.ylabel("Node")
+    plt.savefig(save_path)
 
 @torch.no_grad()
 def init_from_known_poses(self, niter_PnP=10, min_conf_thr=3):
@@ -26,11 +47,11 @@ def init_from_known_poses(self, niter_PnP=10, min_conf_thr=3):
 
     # indices of known poses
     nkp, known_poses_msk, known_poses = get_known_poses(self)
-    assert nkp == self.n_imgs, 'not all poses are known'
+    # assert nkp == self.n_imgs, 'not all poses are known'
 
     # get all focals
     nkf, _, im_focals = get_known_focals(self)
-    assert nkf == self.n_imgs
+    # assert nkf == self.n_imgs
     im_pp = self.get_principal_points()
 
     best_depthmaps = {}
@@ -57,22 +78,27 @@ def init_from_known_poses(self, niter_PnP=10, min_conf_thr=3):
 
     # init all image poses
     for n in range(self.n_imgs):
-        assert known_poses_msk[n]
-        _, i_j, scale = best_depthmaps[n]
-        depth = self.pred_i[i_j][:, :, 2]
-        self._set_depthmap(n, depth * scale)
+        # assert known_poses_msk[n]
+        if n in best_depthmaps:
+            _, i_j, scale = best_depthmaps[n]
+            depth = self.pred_i[i_j][:, :, 2]
+            self._set_depthmap(n, depth * scale)
 
 
 @torch.no_grad()
-def init_minimum_spanning_tree(self, **kw):
+def init_minimum_spanning_tree(self, save_score_path=None, save_score_only=False, **kw):
     """ Init all camera poses (image-wise and pairwise poses) given
         an initial set of pairwise estimations.
     """
     device = self.device
+    if save_score_only:
+        eadge_and_scores = compute_edge_scores(map(i_j_ij, self.edges), self.conf_i, self.conf_j)
+        draw_edge_scores_map(eadge_and_scores, save_score_path)
+        return
     pts3d, _, im_focals, im_poses = minimum_spanning_tree(self.imshapes, self.edges,
                                                           self.pred_i, self.pred_j, self.conf_i, self.conf_j, self.im_conf, self.min_conf_thr,
-                                                          device, has_im_poses=self.has_im_poses, verbose=self.verbose,
-                                                          **kw)
+                                                          device, has_im_poses=self.has_im_poses, verbose=self.verbose, save_score_path=save_score_path,
+                                                           **kw)
 
     return init_from_pts3d(self, pts3d, im_focals, im_poses)
 
@@ -92,6 +118,7 @@ def init_from_pts3d(self, pts3d, im_focals, im_poses):
         im_poses[:, :3, :3] /= s  # undo scaling on the rotation part
         for img_pts3d in pts3d:
             img_pts3d[:] = geotrf(trf, img_pts3d)
+    else: pass # no known poses
 
     # set all pairwise poses
     for e, (i, j) in enumerate(self.edges):
@@ -114,16 +141,23 @@ def init_from_pts3d(self, pts3d, im_focals, im_poses):
             self._set_depthmap(i, depth)
             self._set_pose(self.im_poses, i, cam2world)
             if im_focals[i] is not None:
-                self._set_focal(i, im_focals[i])
+                if not self.shared_focal:
+                    self._set_focal(i, im_focals[i])
+        if self.shared_focal:
+            self._set_focal(0, sum(im_focals) / self.n_imgs)
+        if self.n_imgs > 2:
+            self._set_init_depthmap()
 
     if self.verbose:
-        print(' init loss =', float(self()))
+        with torch.no_grad():
+            print(' init loss =', float(self()))
 
 
 def minimum_spanning_tree(imshapes, edges, pred_i, pred_j, conf_i, conf_j, im_conf, min_conf_thr,
-                          device, has_im_poses=True, niter_PnP=10, verbose=True):
+                          device, has_im_poses=True, niter_PnP=10, verbose=True, save_score_path=None):
     n_imgs = len(imshapes)
-    sparse_graph = -dict_to_sparse_graph(compute_edge_scores(map(i_j_ij, edges), conf_i, conf_j))
+    eadge_and_scores = compute_edge_scores(map(i_j_ij, edges), conf_i, conf_j)
+    sparse_graph = -dict_to_sparse_graph(eadge_and_scores)
     msp = sp.csgraph.minimum_spanning_tree(sparse_graph).tocoo()
 
     # temp variable to store 3d points
@@ -137,8 +171,13 @@ def minimum_spanning_tree(imshapes, edges, pred_i, pred_j, conf_i, conf_j, im_co
     score, i, j = todo.pop()
     if verbose:
         print(f' init edge ({i}*,{j}*) {score=}')
+    if save_score_path is not None:
+        draw_edge_scores_map(eadge_and_scores, save_score_path, n_imgs=n_imgs)
+        save_tree_path = save_score_path.replace(".png", "_tree.txt")
+        with open(save_tree_path, "w") as f:
+            f.write(f'init edge ({i}*,{j}*) {score=}\n')
     i_j = edge_str(i, j)
-    pts3d[i] = pred_i[i_j].clone()
+    pts3d[i] = pred_i[i_j].clone() # the first one is set to be world coordinate
     pts3d[j] = pred_j[i_j].clone()
     done = {i, j}
     if has_im_poses:
@@ -154,9 +193,12 @@ def minimum_spanning_tree(imshapes, edges, pred_i, pred_j, conf_i, conf_j, im_co
         if im_focals[i] is None:
             im_focals[i] = estimate_focal(pred_i[i_j])
 
-        if i in done:
+        if i in done:   # the first frame is already set, align the second frame with the first frame
             if verbose:
                 print(f' init edge ({i},{j}*) {score=}')
+            if save_score_path is not None:
+                with open(save_tree_path, "a") as f:
+                    f.write(f'init edge ({i},{j}*) {score=}\n')
             assert j not in done
             # align pred[i] with pts3d[i], and then set j accordingly
             i_j = edge_str(i, j)
@@ -169,9 +211,12 @@ def minimum_spanning_tree(imshapes, edges, pred_i, pred_j, conf_i, conf_j, im_co
             if has_im_poses and im_poses[i] is None:
                 im_poses[i] = sRT_to_4x4(1, R, T, device)
 
-        elif j in done:
+        elif j in done:  # the second frame is already set, align the first frame with the second frame
             if verbose:
                 print(f' init edge ({i}*,{j}) {score=}')
+            if save_score_path is not None:
+                with open(save_tree_path, "a") as f:
+                    f.write(f'init edge ({i}*,{j}) {score=}\n')
             assert i not in done
             i_j = edge_str(i, j)
             s, R, T = rigid_points_registration(pred_j[i_j], pts3d[j], conf=conf_j[i_j])

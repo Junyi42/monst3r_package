@@ -5,6 +5,7 @@
 # Base class for the global alignement procedure
 # --------------------------------------------------------
 from copy import deepcopy
+import cv2
 
 import numpy as np
 import torch
@@ -22,7 +23,25 @@ from dust3r.optim_factory import adjust_learning_rate_by_lr
 from dust3r.cloud_opt.commons import (edge_str, ALL_DISTS, NoGradParamDict, get_imshapes, signed_expm1, signed_log1p,
                                       cosine_schedule, linear_schedule, get_conf_trf)
 import dust3r.cloud_opt.init_im_poses as init_fun
+from scipy.spatial.transform import Rotation
+import os
+import matplotlib.pyplot as plt
+from PIL import Image
 
+def c2w_to_tumpose(c2w):
+    """
+    Convert a camera-to-world matrix to a tuple of translation and rotation
+    
+    input: c2w: 4x4 matrix
+    output: tuple of translation and rotation (x y z qw qx qy qz)
+    """
+    # convert input to numpy
+    c2w = to_numpy(c2w)
+    xyz = c2w[:3, -1]
+    rot = Rotation.from_matrix(c2w[:3, :3])
+    qx, qy, qz, qw = rot.as_quat()
+    tum_pose = np.concatenate([xyz, [qw, qx, qy, qz]])
+    return tum_pose
 
 class BasePCOptimizer (nn.Module):
     """ Optimize a global scene, given a list of pairwise observations.
@@ -45,11 +64,12 @@ class BasePCOptimizer (nn.Module):
                          dist='l1',
                          conf='log',
                          min_conf_thr=3,
+                         thr_for_init_conf=False,
                          base_scale=0.5,
                          allow_pw_adaptors=False,
                          pw_break=20,
                          rand_pose=torch.randn,
-                         iterationsCount=None,
+                         empty_cache=False,
                          verbose=True):
         super().__init__()
         if not isinstance(view1['idx'], list):
@@ -60,7 +80,7 @@ class BasePCOptimizer (nn.Module):
         self.is_symmetrized = set(self.edges) == {(j, i) for i, j in self.edges}
         self.dist = ALL_DISTS[dist]
         self.verbose = verbose
-
+        self.empty_cache = empty_cache
         self.n_imgs = self._check_edges()
 
         # input data
@@ -71,9 +91,10 @@ class BasePCOptimizer (nn.Module):
         self.imshapes = get_imshapes(self.edges, pred1_pts, pred2_pts)
 
         # work in log-scale with conf
-        pred1_conf = pred1['conf']
-        pred2_conf = pred2['conf']
+        pred1_conf = pred1['conf']  # (Number of image_pairs, H, W)
+        pred2_conf = pred2['conf']  # (Number of image_pairs, H, W)
         self.min_conf_thr = min_conf_thr
+        self.thr_for_init_conf = thr_for_init_conf
         self.conf_trf = get_conf_trf(conf)
 
         self.conf_i = NoGradParamDict({ij: pred1_conf[n] for n, ij in enumerate(self.str_edges)})
@@ -81,6 +102,8 @@ class BasePCOptimizer (nn.Module):
         self.im_conf = self._compute_img_conf(pred1_conf, pred2_conf)
         for i in range(len(self.im_conf)):
             self.im_conf[i].requires_grad = False
+
+        self.init_conf_maps = [c.clone() for c in self.im_conf]
 
         # pairwise pose parameters
         self.base_scale = base_scale
@@ -93,7 +116,7 @@ class BasePCOptimizer (nn.Module):
         self.has_im_poses = False
         self.rand_pose = rand_pose
 
-        # possibly store images for show_pointcloud
+        # possibly store images, camera_pose, instance for show_pointcloud
         self.imgs = None
         if 'img' in view1 and 'img' in view2:
             imgs = [torch.zeros((3,)+hw) for hw in self.imshapes]
@@ -103,6 +126,36 @@ class BasePCOptimizer (nn.Module):
                 idx = view2['idx'][v]
                 imgs[idx] = view2['img'][v]
             self.imgs = rgb(imgs)
+
+        self.dynamic_masks = None
+        if 'dynamic_mask' in view1 and 'dynamic_mask' in view2:
+            dynamic_masks = [torch.zeros(hw) for hw in self.imshapes]
+            for v in range(len(self.edges)):
+                idx = view1['idx'][v]
+                dynamic_masks[idx] = view1['dynamic_mask'][v]
+                idx = view2['idx'][v]
+                dynamic_masks[idx] = view2['dynamic_mask'][v]
+            self.dynamic_masks = dynamic_masks
+
+        self.camera_poses = None
+        if 'camera_pose' in view1 and 'camera_pose' in view2:
+            camera_poses = [torch.zeros((4, 4)) for _ in range(self.n_imgs)]
+            for v in range(len(self.edges)):
+                idx = view1['idx'][v]
+                camera_poses[idx] = view1['camera_pose'][v]
+                idx = view2['idx'][v]
+                camera_poses[idx] = view2['camera_pose'][v]
+            self.camera_poses = camera_poses
+
+        self.img_pathes = None
+        if 'instance' in view1 and 'instance' in view2:
+            img_pathes = ['' for _ in range(self.n_imgs)]
+            for v in range(len(self.edges)):
+                idx = view1['idx'][v]
+                img_pathes[idx] = view1['instance'][v]
+                idx = view2['idx'][v]
+                img_pathes[idx] = view2['instance'][v]
+            self.img_pathes = img_pathes
 
     @property
     def n_edges(self):
@@ -195,13 +248,16 @@ class BasePCOptimizer (nn.Module):
         return scaled_RT
 
     def get_masks(self):
-        return [(conf > self.min_conf_thr) for conf in self.im_conf]
+        if self.thr_for_init_conf:
+            return [(conf > self.min_conf_thr) for conf in self.init_conf_maps]
+        else:
+            return [(conf > self.min_conf_thr) for conf in self.im_conf]
 
     def depth_to_pts3d(self):
         raise NotImplementedError()
 
-    def get_pts3d(self, raw=False):
-        res = self.depth_to_pts3d()
+    def get_pts3d(self, raw=False, **kwargs):
+        res = self.depth_to_pts3d(**kwargs)
         if not raw:
             res = [dm[:h*w].view(h, w, 3) for dm, (h, w) in zip(res, self.imshapes)]
         return res
@@ -221,6 +277,10 @@ class BasePCOptimizer (nn.Module):
     def get_conf(self, mode=None):
         trf = self.conf_trf if mode is None else get_conf_trf(mode)
         return [trf(c) for c in self.im_conf]
+    
+    def get_init_conf(self, mode=None):
+        trf = self.conf_trf if mode is None else get_conf_trf(mode)
+        return [trf(c) for c in self.init_conf_maps]
 
     def get_im_poses(self):
         raise NotImplementedError()
@@ -242,6 +302,67 @@ class BasePCOptimizer (nn.Module):
         for i, new_conf in enumerate(new_im_confs):
             self.im_conf[i].data[:] = new_conf
         return self
+
+    def get_tum_poses(self):
+        poses = self.get_im_poses()
+        tt = np.arange(len(poses)).astype(float)
+        tum_poses = [c2w_to_tumpose(p) for p in poses]
+        tum_poses = np.stack(tum_poses, 0)
+        return [tum_poses, tt]
+    
+    def save_focals(self, path):
+        # convert focal to txt
+        focals = self.get_focals()
+        np.savetxt(path, focals.detach().cpu().numpy(), fmt='%.6f')
+        return focals
+
+    def save_intrinsics(self, path):
+        K_raw = self.get_intrinsics()
+        K = K_raw.reshape(-1, 9)
+        np.savetxt(path, K.detach().cpu().numpy(), fmt='%.6f')
+        return K_raw
+
+    def save_conf_maps(self, path):
+        conf = self.get_conf()
+        for i, c in enumerate(conf):
+            np.save(f'{path}/conf_{i}.npy', c.detach().cpu().numpy())
+        return conf
+    
+    def save_init_conf_maps(self, path):
+        conf = self.get_init_conf()
+        for i, c in enumerate(conf):
+            np.save(f'{path}/init_conf_{i}.npy', c.detach().cpu().numpy())
+        return conf
+
+    def save_rgb_imgs(self, path):
+        imgs = self.imgs
+        for i, img in enumerate(imgs):
+            # convert from rgb to bgr
+            img = img[..., ::-1]
+            cv2.imwrite(f'{path}/frame_{i:04d}.png', img*255)
+        return imgs
+
+    def save_dynamic_masks(self, path):
+        dynamic_masks = self.dynamic_masks if getattr(self, 'sam2_dynamic_masks', None) is None else self.sam2_dynamic_masks
+        for i, dynamic_mask in enumerate(dynamic_masks):
+            cv2.imwrite(f'{path}/dynamic_mask_{i}.png', (dynamic_mask * 255).detach().cpu().numpy().astype(np.uint8))
+        return dynamic_masks
+
+    def save_depth_maps(self, path):
+        depth_maps = self.get_depthmaps()
+        images = []
+        
+        for i, depth_map in enumerate(depth_maps):
+            # Apply color map to depth map
+            depth_map_colored = cv2.applyColorMap((depth_map * 255).detach().cpu().numpy().astype(np.uint8), cv2.COLORMAP_JET)
+            img_path = f'{path}/frame_{(i):04d}.png'
+            cv2.imwrite(img_path, depth_map_colored)
+            images.append(Image.open(img_path))
+            np.save(f'{path}/frame_{(i):04d}.npy', depth_map.detach().cpu().numpy())
+        
+        images[0].save(f'{path}/_depth_maps.gif', save_all=True, append_images=images[1:], duration=100, loop=0)
+        
+        return depth_maps
 
     def forward(self, ret_details=False):
         pw_poses = self.get_pw_poses()  # cam-to-world
@@ -273,12 +394,15 @@ class BasePCOptimizer (nn.Module):
         return loss
 
     @torch.cuda.amp.autocast(enabled=False)
-    def compute_global_alignment(self, init=None, niter_PnP=10, **kw):
+    def compute_global_alignment(self, init=None, save_score_path=None, save_score_only=False, niter_PnP=10, **kw):
         if init is None:
             pass
         elif init == 'msp' or init == 'mst':
-            init_fun.init_minimum_spanning_tree(self, niter_PnP=niter_PnP)
+            init_fun.init_minimum_spanning_tree(self, save_score_path=save_score_path, save_score_only=save_score_only, niter_PnP=niter_PnP)
+            if save_score_only: # if only want the score map
+                return None
         elif init == 'known_poses':
+            self.preset_pose(known_poses=self.camera_poses, requires_grad=True)
             init_fun.init_from_known_poses(self, min_conf_thr=self.min_conf_thr,
                                            niter_PnP=niter_PnP)
         else:
@@ -323,7 +447,7 @@ class BasePCOptimizer (nn.Module):
         return viz
 
 
-def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6):
+def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-3, temporal_smoothing_weight=0, depth_map_save_dir=None):
     params = [p for p in net.parameters() if p.requires_grad]
     if not params:
         return net
@@ -340,16 +464,27 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
     if verbose:
         with tqdm.tqdm(total=niter) as bar:
             while bar.n < bar.total:
-                loss, lr = global_alignment_iter(net, bar.n, niter, lr_base, lr_min, optimizer, schedule)
+                if bar.n % 500 == 0 and depth_map_save_dir is not None:
+                    if not os.path.exists(depth_map_save_dir):
+                        os.makedirs(depth_map_save_dir)
+                    # visualize the depthmaps
+                    depth_maps = net.get_depthmaps()
+                    for i, depth_map in enumerate(depth_maps):
+                        depth_map_save_path = os.path.join(depth_map_save_dir, f'depthmaps_{i}_iter_{bar.n}.png')
+                        plt.imsave(depth_map_save_path, depth_map.detach().cpu().numpy(), cmap='jet')
+                    print(f"Saved depthmaps at iteration {bar.n} to {depth_map_save_dir}")
+                loss, lr = global_alignment_iter(net, bar.n, niter, lr_base, lr_min, optimizer, schedule, 
+                                                 temporal_smoothing_weight=temporal_smoothing_weight)
                 bar.set_postfix_str(f'{lr=:g} loss={loss:g}')
                 bar.update()
     else:
         for n in range(niter):
-            loss, _ = global_alignment_iter(net, n, niter, lr_base, lr_min, optimizer, schedule)
+            loss, _ = global_alignment_iter(net, n, niter, lr_base, lr_min, optimizer, schedule, 
+                                            temporal_smoothing_weight=temporal_smoothing_weight)
     return loss
 
 
-def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, schedule):
+def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, schedule, temporal_smoothing_weight=0):
     t = cur_iter / niter
     if schedule == 'cosine':
         lr = cosine_schedule(t, lr_base, lr_min)
@@ -357,13 +492,27 @@ def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, sche
         lr = linear_schedule(t, lr_base, lr_min)
     else:
         raise ValueError(f'bad lr {schedule=}')
+    
     adjust_learning_rate_by_lr(optimizer, lr)
     optimizer.zero_grad()
-    loss = net()
-    loss.backward()
-    optimizer.step()
 
+    if net.empty_cache:
+        torch.cuda.empty_cache()
+    
+    loss = net(epoch=cur_iter)
+    
+    if net.empty_cache:
+        torch.cuda.empty_cache()
+    
+    loss.backward()
+    
+    if net.empty_cache:
+        torch.cuda.empty_cache()
+    
+    optimizer.step()
+    
     return float(loss), lr
+
 
 
 @torch.no_grad()
