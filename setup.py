@@ -1,8 +1,6 @@
 from setuptools import setup, find_packages
 import os
 
-sam2_path = os.path.join(os.getcwd(), 'third_party', 'sam2')
-
 print('find_packages:', find_packages())
 setup(
     description='Monst3r as a package',
@@ -23,7 +21,7 @@ setup(
         'tensorboard',
         'pyglet<2',
         'huggingface-hub[torch]>=0.22',
-        f"file://localhost/{sam2_path}",
+        "sam2 @ file://localhost/" + os.path.abspath("third_party/sam2"),
     ],
     extras_require={
         'all': [
