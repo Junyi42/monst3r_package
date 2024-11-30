@@ -252,7 +252,7 @@ class PointCloudOptimizer(BasePCOptimizer):
                 torch.backends.cudnn.allow_tf32 = True
 
         try:
-            autocast_dtype = torch.bfloat16 if device == 'cuda' else torch.float32
+            autocast_dtype = torch.bfloat16 if device == 'cuda' and torch.cuda.get_device_capability()[0] >= 8 else torch.float32
             with torch.autocast(device_type=device, dtype=autocast_dtype):
                 predictor = build_sam2_video_predictor(model_cfg, self.sam2_checkpoint, device=device)
                 frame_tensors = torch.from_numpy(np.array((self.imgs))).permute(0, 3, 1, 2).to(device)
