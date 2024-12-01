@@ -8,6 +8,7 @@ import os
 import torch
 import numpy as np
 import PIL.Image
+import glob
 from PIL.ImageOps import exif_transpose
 import torchvision.transforms as tvf
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
@@ -124,3 +125,11 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
     if verbose:
         print(f' (Found {len(imgs)} images)')
     return imgs
+
+def enlarge_seg_masks(folder, kernel_size=5, prefix="dynamic_mask"):
+    mask_pathes = glob.glob(f'{folder}/{prefix}_*.png')
+    for mask_path in mask_pathes:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        kernel = np.ones((kernel_size, kernel_size),np.uint8)
+        enlarged_mask = cv2.dilate(mask, kernel, iterations=1)
+        cv2.imwrite(mask_path.replace(prefix, 'enlarged_dynamic_mask'), enlarged_mask)
