@@ -395,7 +395,10 @@ class PointCloudOptimizer(BasePCOptimizer):
         assert tensor.requires_grad, 'it must be True at this point, otherwise no modification occurs'
 
     def _set_focal(self, idx, focal, force=False):
-        param = self.im_focals[idx]
+        if self.shared_focal:
+            param = self.im_focals[0] 
+        else:
+            param = self.im_focals[idx]
         if param.requires_grad or force:  # can only init a parameter not already initialized
             param.data[:] = self.focal_break * np.log(focal)
         return param
@@ -541,7 +544,7 @@ class PointCloudOptimizer(BasePCOptimizer):
             flow_loss_i = self.flow_loss_fn(ego_flow_1_2[:, :2, ...], self.flow_ij, ~dynamic_mask1, per_pixel_thre=self.pxl_thre)
             flow_loss_j = self.flow_loss_fn(ego_flow_2_1[:, :2, ...], self.flow_ji, ~dynamic_mask2, per_pixel_thre=self.pxl_thre)
             flow_loss = flow_loss_i + flow_loss_j
-            print(f'flow loss: {flow_loss.item()}')
+            # print(f'flow loss: {flow_loss.item()}')
             if flow_loss.item() > self.flow_loss_thre and self.flow_loss_thre > 0: 
                 flow_loss = 0
                 self.flow_loss_flag = True
