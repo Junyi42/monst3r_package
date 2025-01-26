@@ -8,8 +8,8 @@ setup(
     version='0.0',
     packages=find_packages(),
     install_requires=[
-        'torch==2.0.1',
-        'torchvision==0.15.2',
+        'torch>=2.0.1',
+        'torchvision>=0.15.2',
         'roma',
         'gradio',
         'matplotlib',
@@ -24,7 +24,7 @@ setup(
         'websockets==13.1',
         "seaborn",
         "sam2 @ file://localhost/" + os.path.abspath("third_party/sam2"),
-        "depth_pro @ file://localhost/" + os.path.abspath("third_party/ml-depth-pro"),
+        # "depth_pro @ file://localhost/" + os.path.abspath("third_party/ml-depth-pro"),
     ],
     extras_require={
         'all': [
